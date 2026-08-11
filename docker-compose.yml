@@ -63,7 +63,14 @@ services:
       - notes-network
     command: >
       sh -c "flask db upgrade &&
+             python -m app.seed &&
              gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 120 --reload wsgi:app"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
 
   frontend:
     build:
