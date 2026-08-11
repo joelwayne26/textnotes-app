@@ -120,6 +120,11 @@ export const tagsApi = {
       method: "POST",
       body: JSON.stringify(data),
     }),
+  update: (id: number, data: { name: string; color?: string }) =>
+    api<import("@/types").Tag>(`/api/tags/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
   delete: (id: number) =>
     api<{ message: string }>(`/api/tags/${id}`, { method: "DELETE" }),
 };

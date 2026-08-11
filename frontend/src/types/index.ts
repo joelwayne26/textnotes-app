@@ -10,6 +10,7 @@ export interface Tag {
   name: string;
   color: string;
   owner_id: number;
+  created_at?: string | null;
 }
 
 export interface Attachment {
@@ -42,6 +43,7 @@ export interface Folder {
   parent_id: number | null;
   owner_id: number;
   children?: Folder[];
+  notes_count?: number;
   created_at: string | null;
   updated_at: string | null;
 }
