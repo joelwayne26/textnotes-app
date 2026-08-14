@@ -4,19 +4,29 @@ Run: python -m app.seed
 OR in Docker: docker exec notes-backend python -m app.seed
 """
 
-from app import create_app
-from app.extensions import db
-from app.models import User, Folder, Tag, Note
+import asyncio
+from sqlalchemy import select
+from app.extensions import sync_engine, Base
+from app.models import User, Folder, Tag, Note, note_tags
 
-app = create_app()
 
 def seed():
-    with app.app_context():
-        # Create tables if not exist
-        db.create_all()
-        
+    """Synchronous seed function for initial data creation"""
+    
+    # Create tables if not exist (using sync engine for Alembic compatibility)
+    Base.metadata.create_all(sync_engine)
+    
+    from sqlalchemy.orm import Sessionmaker
+    session = Sessionmaker(bind=sync_engine)
+    db = session()
+    
+    try:
         # Check if demo user exists
-        existing = User.query.filter_by(email="demo@textnotes.com").first()
+        result = db.execute(
+            select(User).where(User.email == "demo@textnotes.com")
+        )
+        existing = result.scalar_one_or_none()
+        
         if existing:
             print("✅ Demo user already exists")
             return
@@ -27,8 +37,8 @@ def seed():
             username="demo"
         )
         demo_user.set_password("password123")
-        db.session.add(demo_user)
-        db.session.flush()  # Get ID
+        db.add(demo_user)
+        db.flush()  # Get ID
         
         # Create sample folders
         folders = [
@@ -36,8 +46,8 @@ def seed():
             Folder(name="Work", owner_id=demo_user.id),
             Folder(name="Ideas", owner_id=demo_user.id),
         ]
-        db.session.add_all(folders)
-        db.session.flush()
+        db.add_all(folders)
+        db.flush()
         
         # Create sample tags
         tags = [
@@ -46,16 +56,16 @@ def seed():
             Tag(name="personal", color="#22c55e", owner_id=demo_user.id),
             Tag(name="ideas", color="#eab308", owner_id=demo_user.id),
         ]
-        db.session.add_all(tags)
-        db.session.flush()
+        db.add_all(tags)
+        db.flush()
         
         # Create sample notes
-        notes = [
-            Note(
-                title="Welcome to TextNotes! 🎉",
-                content="""# Welcome to TextNotes!
+        notes_data = [
+            {
+                "title": "Welcome to TextNotes! 🎉",
+                "content": """# Welcome to TextNotes!
 
-This is your **new** notes application. Here's what you can do:
+This is your **new** notes application built with **FastAPI**! Here's what you can do:
 
 ## Features
 - ✅ Create and edit notes with Markdown support
@@ -70,14 +80,13 @@ This is your **new** notes application. Here's what you can do:
 3. Search through all your notes instantly
 
 Happy note-taking! 📝""",
-                is_pinned=True,
-                owner_id=demo_user.id,
-                folder_id=folders[0].id,  # Personal
-                tags=[tags[0], tags[2]],  # important, personal
-            ),
-            Note(
-                title="Project Meeting Notes",
-                content="""# Project Meeting - Q4 Planning
+                "is_pinned": True,
+                "folder_idx": 0,
+                "tag_indices": [0, 2],
+            },
+            {
+                "title": "Project Meeting Notes",
+                "content": """# Project Meeting - Q4 Planning
 
 ## Attendees
 - Team Lead
@@ -93,13 +102,13 @@ Happy note-taking! 📝""",
 1. Move to microservices architecture
 2. Adopt TypeScript for new features
 3. Implement CI/CD pipeline""",
-                owner_id=demo_user.id,
-                folder_id=folders[1].id,  # Work
-                tags=[tags[1], tags[0]],  # work, important
-            ),
-            Note(
-                title="App Ideas",
-                content="""# App Ideas 💡
+                "is_pinned": False,
+                "folder_idx": 1,
+                "tag_indices": [1, 0],
+            },
+            {
+                "title": "App Ideas 💡",
+                "content": """# App Ideas
 
 ## Ideas List
 1. AI-powered task manager
@@ -111,13 +120,13 @@ Happy note-taking! 📝""",
 - Research competitors
 - Create MVP roadmap
 - Design wireframes""",
-                owner_id=demo_user.id,
-                folder_id=folders[2].id,  # Ideas
-                tags=[tags[3], tags[0]],  # ideas, important
-            ),
-            Note(
-                title="Shopping List",
-                content="""# Shopping List 🛒
+                "is_pinned": False,
+                "folder_idx": 2,
+                "tag_indices": [3, 0],
+            },
+            {
+                "title": "Shopping List 🛒",
+                "content": """# Shopping List
 
 ## Groceries
 - [ ] Milk
@@ -129,20 +138,48 @@ Happy note-taking! 📝""",
 ## Other Items
 - [ ] Paper towels
 - [ ] Dish soap""",
-                is_archived=True,
-                owner_id=demo_user.id,
-                folder_id=folders[0].id,  # Personal
-                tags=[tags[2]],  # personal
-            ),
+                "is_pinned": False,
+                "is_archived": True,
+                "folder_idx": 0,
+                "tag_indices": [2],
+            },
         ]
-        db.session.add_all(notes)
-        db.session.commit()
+        
+        created_notes = []
+        for note_data in notes_data:
+            note = Note(
+                title=note_data["title"],
+                content=note_data["content"],
+                is_pinned=note_data.get("is_pinned", False),
+                is_archived=note_data.get("is_archived", False),
+                owner_id=demo_user.id,
+                folder_id=folders[note_data["folder_idx"]].id,
+            )
+            
+            # Add tags
+            for tag_idx in note_data.get("tag_indices", []):
+                note.tags.append(tags[tag_idx])
+            
+            db.add(note)
+            created_notes.append(note)
+        
+        db.commit()
         
         print("✅ Demo data created successfully!")
         print(f"   User: demo@textnotes.com / password123")
         print(f"   Created {len(folders)} folders")
         print(f"   Created {len(tags)} tags")
-        print(f"   Created {len(notes)} notes")
+        print(f"   Created {len(created_notes)} notes")
+        print("\n🚀 FastAPI is now running at http://localhost:5000")
+        print("📚 API Docs available at http://localhost:5000/docs")
+        
+    except Exception as e:
+        db.rollback()
+        print(f"❌ Error creating seed data: {e}")
+        raise
+    finally:
+        db.close()
+
 
 if __name__ == "__main__":
     seed()

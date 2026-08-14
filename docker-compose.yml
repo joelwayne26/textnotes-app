@@ -44,11 +44,16 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-notes}:${POSTGRES_PASSWORD:-notes_secret}@db:5432/${POSTGRES_DB:-notes_db}
+      # Database URLs (async for FastAPI, sync for Alembic)
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-notes}:${POSTGRES_PASSWORD:-notes_secret}@db:5432/${POSTGRES_DB:-notes_db}
+      SYNC_DATABASE_URL: postgresql://${POSTGRES_USER:-notes}:${POSTGRES_PASSWORD:-notes_secret}@db:5432/${POSTGRES_DB:-notes_db}
       REDIS_URL: redis://redis:6379/0
-      FLASK_ENV: ${FLASK_ENV:-development}
+      # FastAPI settings
+      APP_ENV: ${APP_ENV:-development}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY}
       UPLOAD_FOLDER: /app/uploads
+      # CORS origins
+      CORS_ORIGINS: '["http://localhost:3000","http://127.0.0.1:3000"]'
     volumes:
       - ./backend:/app
       - uploads_data:/app/uploads
@@ -62,9 +67,10 @@ services:
     networks:
       - notes-network
     command: >
-      sh -c "flask db upgrade &&
+      sh -c "pip install psycopg2-binary &&
+             python -c 'from app.extensions import sync_engine; from app.models import Base; Base.metadata.create_all(sync_engine)' &&
              python -m app.seed &&
-             gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 120 --reload wsgi:app"
+             uvicorn asgi:app --host 0.0.0.0 --port 5000 --workers 2 --reload"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 10s

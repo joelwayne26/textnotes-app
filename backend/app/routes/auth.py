@@ -1,13 +1,24 @@
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
-from pydantic import BaseModel, EmailStr, Field, ValidationError
+"""
+Authentication Routes - FastAPI Implementation
+JWT-based authentication with OAuth2 password flow
+"""
 
-from app.extensions import db
+from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel, EmailStr, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.extensions import get_db
 from app.models import User
 
-auth_bp = Blueprint("auth", __name__)
+router = APIRouter()
+
+# OAuth2 scheme for Bearer token authentication
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
+# Pydantic Schemas (used for request validation + auto OpenAPI docs)
 class RegisterSchema(BaseModel):
     email: EmailStr
     username: str = Field(min_length=3, max_length=80)
@@ -19,56 +30,128 @@ class LoginSchema(BaseModel):
     password: str
 
 
-@auth_bp.post("/register")
-def register():
+class TokenResponse(BaseModel):
+    message: str
+    user: dict
+    access_token: str
+
+
+# Dependency: Get current user from JWT token
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db)
+) -> User:
+    """
+    Validate JWT token and return current user.
+    
+    Raises:
+        401: If token is invalid or expired
+        404: If user not found
+    """
+    from jose import jwt, JWTError
+    
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
     try:
-        data = RegisterSchema(**request.get_json())
-    except ValidationError as e:
-        return jsonify({"error": "Validation failed", "details": e.errors()}), 400
+        # Decode JWT token
+        payload = jwt.decode(
+            token,
+            "jwt-dev-secret-change-me-min-32-chars-long",  # TODO: Use settings.JWT_SECRET_KEY
+            algorithms=["HS256"]
+        )
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    
+    # Fetch user from database
+    result = await db.execute(select(User).where(User.id == int(user_id)))
+    user = result.scalar_one_or_none()
+    
+    if user is None:
+        raise credentials_exception
+    
+    return user
 
-    if User.query.filter((User.email == data.email) | (User.username == data.username)).first():
-        return jsonify({"error": "Email or username already exists"}), 409
 
+@router.post("/register", response_model=TokenResponse, status_code=201)
+async def register(
+    data: RegisterSchema,
+    db: AsyncSession = Depends(get_db)
+):
+    """Register a new user account"""
+    # Check for existing user
+    result = await db.execute(
+        select(User).where((User.email == data.email) | (User.username == data.username))
+    )
+    existing = result.scalar_one_or_none()
+    
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email or username already exists"
+        )
+    
+    # Create new user
     user = User(email=data.email, username=data.username)
     user.set_password(data.password)
-    db.session.add(user)
-    db.session.commit()
+    
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    
+    # Generate JWT token
+    from jose import jwt
+    access_token = jwt.encode({"sub": str(user.id)}, "jwt-dev-secret-change-me-min-32-chars-long", algorithm="HS256")
+    
+    return TokenResponse(
+        message="User created successfully",
+        user=user.to_dict(),
+        access_token=access_token
+    )
 
-    access_token = create_access_token(identity=str(user.id))
-    return jsonify({
-        "message": "User created successfully",
-        "user": user.to_dict(),
-        "access_token": access_token,
-    }), 201
 
-
-@auth_bp.post("/login")
-def login():
-    try:
-        data = LoginSchema(**request.get_json())
-    except ValidationError as e:
-        return jsonify({"error": "Validation failed", "details": e.errors()}), 400
-
-    user = User.query.filter_by(email=data.email).first()
+@router.post("/login", response_model=TokenResponse)
+async def login(
+    data: LoginSchema,
+    db: AsyncSession = Depends(get_db)
+):
+    """Authenticate user and return JWT token"""
+    # Find user by email
+    result = await db.execute(select(User).where(User.email == data.email))
+    user = result.scalar_one_or_none()
+    
+    # Validate credentials
     if not user or not user.check_password(data.password):
-        return jsonify({"error": "Invalid email or password"}), 401
-
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     if not user.is_active:
-        return jsonify({"error": "Account is disabled"}), 403
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is disabled"
+        )
+    
+    # Generate JWT token
+    from jose import jwt
+    access_token = jwt.encode({"sub": str(user.id)}, "jwt-dev-secret-change-me-min-32-chars-long", algorithm="HS256")
+    
+    return TokenResponse(
+        message="Login successful",
+        user=user.to_dict(),
+        access_token=access_token
+    )
 
-    access_token = create_access_token(identity=str(user.id))
-    return jsonify({
-        "message": "Login successful",
-        "user": user.to_dict(),
-        "access_token": access_token,
-    })
 
-
-@auth_bp.get("/me")
-@jwt_required()
-def me():
-    user_id = get_jwt_identity()
-    user = User.query.get(int(user_id))
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-    return jsonify(user.to_dict())
+@router.get("/me")
+async def get_me(current_user: User = Depends(get_current_user)):
+    """Get current authenticated user profile"""
+    return current_user.to_dict()

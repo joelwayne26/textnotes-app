@@ -1,15 +1,23 @@
-from flask import Flask
+"""
+FastAPI Router Registration
+All API routes are registered here with proper prefixes
+"""
 
-from app.routes.auth import auth_bp
-from app.routes.notes import notes_bp
-from app.routes.folders import folders_bp
-from app.routes.tags import tags_bp
-from app.routes.attachments import attachments_bp
+from fastapi import APIRouter
+
+from app.routes.auth import router as auth_router
+from app.routes.notes import router as notes_router
+from app.routes.folders import router as folders_router
+from app.routes.tags import router as tags_router
+from app.routes.attachments import router as attachments_router
 
 
-def register_blueprints(app: Flask) -> None:
-    app.register_blueprint(auth_bp, url_prefix="/api/auth")
-    app.register_blueprint(notes_bp, url_prefix="/api/notes")
-    app.register_blueprint(folders_bp, url_prefix="/api/folders")
-    app.register_blueprint(tags_bp, url_prefix="/api/tags")
-    app.register_blueprint(attachments_bp, url_prefix="/api/attachments")
+# Main API Router - combines all sub-routers
+router = APIRouter()
+
+# Include all route modules with their prefixes
+router.include_router(auth_router, prefix="/auth", tags=["Authentication"])
+router.include_router(notes_router, prefix="/notes", tags=["Notes"])
+router.include_router(folders_router, prefix="/folders", tags=["Folders"])
+router.include_router(tags_router, prefix="/tags", tags=["Tags"])
+router.include_router(attachments_router, prefix="/attachments", tags=["Attachments"])

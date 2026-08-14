@@ -1,18 +1,24 @@
-Flask==3.0.3
-Flask-SQLAlchemy==3.1.1
-Flask-Migrate==4.0.7
-Flask-JWT-Extended==4.6.0
-Flask-CORS==4.0.1
-psycopg2-binary==2.9.9
-SQLAlchemy==2.0.31
+# FastAPI & ASGI Server
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+python-jose[cryptography]==3.3.0
+
+# Database (Async SQLAlchemy)
+sqlalchemy[asyncio]==2.0.31
+asyncpg==0.29.0
 alembic==1.13.2
+psycopg2-binary==2.9.9  # For Alembic migrations (sync)
+
+# Data Validation
 pydantic==2.8.2
 pydantic-settings==2.3.4
-python-dotenv==1.0.1
-gunicorn==22.0.0
-redis==5.0.7
-Werkzeug==3.0.3
 email-validator==2.2.0
+
+# Middleware
+python-multipart==0.0.9  # For file uploads
+
+# Utilities
+python-dotenv==1.0.1
 markdown==3.6
 bleach==6.1.0
 python-slugify==8.0.4

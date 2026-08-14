@@ -1,15 +1,22 @@
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity
-from pydantic import BaseModel, Field, ValidationError
-from sqlalchemy import or_, and_
+"""
+Notes CRUD Routes - FastAPI Implementation
+Full async support with proper Pydantic validation
+"""
+
+from fastapi import APIRouter, HTTPException, Depends, Query, status
+from pydantic import BaseModel, Field
 from typing import Optional, List
+from sqlalchemy import select, or_, func
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.extensions import db
+from app.extensions import get_db
 from app.models import Note, Tag, Folder
+from app.routes.auth import get_current_user, User
 
-notes_bp = Blueprint("notes", __name__)
+router = APIRouter()
 
 
+# Pydantic Schemas for Request/Response Validation
 class NoteCreateSchema(BaseModel):
     title: str = Field(min_length=1, max_length=255)
     content: str = ""
@@ -27,127 +34,216 @@ class NoteUpdateSchema(BaseModel):
     is_archived: Optional[bool] = None
 
 
-def get_current_user_id() -> int:
-    return int(get_jwt_identity())
+class NoteResponse(BaseModel):
+    """Response schema for note (matches to_dict output)"""
+    id: int
+    title: str
+    content: Optional[str] = None
+    is_pinned: bool
+    is_archived: bool
+    owner_id: int
+    folder_id: Optional[int] = None
+    tags: List[dict] = []
+    attachments: List[dict] = []
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
 
 
-@notes_bp.get("")
-@jwt_required()
-def list_notes():
-    user_id = get_current_user_id()
-    q = request.args.get("q", "").strip()
-    folder_id = request.args.get("folder_id")
-    tag_id = request.args.get("tag_id")
-    archived = request.args.get("archived", "false").lower() == "true"
-    pinned = request.args.get("pinned")
-
-    query = Note.query.filter_by(owner_id=user_id, is_archived=archived)
-
-    if folder_id:
-        query = query.filter_by(folder_id=int(folder_id))
-    if tag_id:
-        query = query.filter(Note.tags.any(Tag.id == int(tag_id)))
+@router.get("", response_model=List[dict])
+async def list_notes(
+    q: Optional[str] = Query(None, description="Search query"),
+    folder_id: Optional[int] = Query(None, description="Filter by folder"),
+    tag_id: Optional[int] = Query(None, description="Filter by tag"),
+    archived: bool = Query(False, description="Show archived notes"),
+    pinned: Optional[bool] = Query(None, description="Filter pinned notes"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List all notes for current user.
+    
+    Supports filtering by:
+    - Search query (title + content)
+    - Folder ID
+    - Tag ID
+    - Archive status
+    - Pin status
+    """
+    # Build base query
+    query = select(Note).where(
+        Note.owner_id == current_user.id,
+        Note.is_archived == archived
+    )
+    
+    # Apply filters
+    if folder_id is not None:
+        query = query.where(Note.folder_id == folder_id)
+    
+    if tag_id is not None:
+        query = query.where(Note.tags.any(Tag.id == tag_id))
+    
     if pinned is not None:
-        query = query.filter_by(is_pinned=pinned.lower() == "true")
-
+        query = query.where(Note.is_pinned == pinned)
+    
     if q:
-        # Simple full-text like search (title + content)
         search = f"%{q}%"
-        query = query.filter(
+        query = query.where(
             or_(Note.title.ilike(search), Note.content.ilike(search))
         )
+    
+    # Order: pinned first, then by updated_at desc
+    query = query.order_by(Note.is_pinned.desc(), Note.updated_at.desc())
+    
+    result = await db.execute(query)
+    notes = result.scalars().all()
+    
+    return [note.to_dict(include_content=False) for note in notes]
 
-    notes = query.order_by(Note.is_pinned.desc(), Note.updated_at.desc()).all()
-    return jsonify([n.to_dict(include_content=False) for n in notes])
 
-
-@notes_bp.post("")
-@jwt_required()
-def create_note():
-    user_id = get_current_user_id()
-    try:
-        data = NoteCreateSchema(**request.get_json())
-    except ValidationError as e:
-        return jsonify({"error": "Validation failed", "details": e.errors()}), 400
-
+@router.post("", response_model=dict, status_code=201)
+async def create_note(
+    data: NoteCreateSchema,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a new note"""
+    # Validate folder exists and belongs to user
     if data.folder_id:
-        folder = Folder.query.filter_by(id=data.folder_id, owner_id=user_id).first()
+        result = await db.execute(
+            select(Folder).where(Folder.id == data.folder_id, Folder.owner_id == current_user.id)
+        )
+        folder = result.scalar_one_or_none()
         if not folder:
-            return jsonify({"error": "Folder not found"}), 404
-
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Folder not found"
+            )
+    
+    # Create note
     note = Note(
         title=data.title,
         content=data.content,
         folder_id=data.folder_id,
         is_pinned=data.is_pinned,
-        owner_id=user_id,
+        owner_id=current_user.id,
     )
-
+    
+    # Add tags if provided
     if data.tag_ids:
-        tags = Tag.query.filter(Tag.id.in_(data.tag_ids), Tag.owner_id == user_id).all()
-        note.tags = tags
+        result = await db.execute(
+            select(Tag).where(Tag.id.in_(data.tag_ids), Tag.owner_id == current_user.id)
+        )
+        tags = result.scalars().all()
+        note.tags.extend(tags)
+    
+    db.add(note)
+    await db.commit()
+    await db.refresh(note)
+    
+    return note.to_dict()
 
-    db.session.add(note)
-    db.session.commit()
-    return jsonify(note.to_dict()), 201
 
-
-@notes_bp.get("/<int:note_id>")
-@jwt_required()
-def get_note(note_id: int):
-    user_id = get_current_user_id()
-    note = Note.query.filter_by(id=note_id, owner_id=user_id).first()
+@router.get("/{note_id}", response_model=dict)
+async def get_note(
+    note_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get a single note by ID (includes full content)"""
+    result = await db.execute(
+        select(Note).where(Note.id == note_id, Note.owner_id == current_user.id)
+    )
+    note = result.scalar_one_or_none()
+    
     if not note:
-        return jsonify({"error": "Note not found"}), 404
-    return jsonify(note.to_dict())
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Note not found"
+        )
+    
+    return note.to_dict()
 
 
-@notes_bp.put("/<int:note_id>")
-@jwt_required()
-def update_note(note_id: int):
-    user_id = get_current_user_id()
-    note = Note.query.filter_by(id=note_id, owner_id=user_id).first()
+@router.put("/{note_id}", response_model=dict)
+async def update_note(
+    note_id: int,
+    data: NoteUpdateSchema,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update an existing note"""
+    result = await db.execute(
+        select(Note).where(Note.id == note_id, Note.owner_id == current_user.id)
+    )
+    note = result.scalar_one_or_none()
+    
     if not note:
-        return jsonify({"error": "Note not found"}), 404
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Note not found"
+        )
+    
+    # Update fields only if provided
+    update_data = data.model_dump(exclude_unset=True)
+    
+    if "folder_id" in update_data and update_data["folder_id"] == 0:
+        update_data["folder_id"] = None
+    elif "folder_id" in update_data and update_data["folder_id"]:
+        # Validate folder belongs to user
+        folder_result = await db.execute(
+            select(Folder).where(
+                Folder.id == update_data["folder_id"], 
+                Folder.owner_id == current_user.id
+            )
+        )
+        if not folder_result.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Folder not found"
+            )
+    
+    # Update tags separately
+    if "tag_ids" in update_data:
+        tag_ids = update_data.pop("tag_ids")
+        if tag_ids is not None:
+            tag_result = await db.execute(
+                select(Tag).where(Tag.id.in_(tag_ids), Tag.owner_id == current_user.id)
+            )
+            tags = tag_result.scalars().all()
+            note.tags = tags
+    
+    # Apply remaining updates
+    for field, value in update_data.items():
+        setattr(note, field, value)
+    
+    await db.commit()
+    await db.refresh(note)
+    
+    return note.to_dict()
 
-    try:
-        data = NoteUpdateSchema(**request.get_json())
-    except ValidationError as e:
-        return jsonify({"error": "Validation failed", "details": e.errors()}), 400
 
-    if data.title is not None:
-        note.title = data.title
-    if data.content is not None:
-        note.content = data.content
-    if data.is_pinned is not None:
-        note.is_pinned = data.is_pinned
-    if data.is_archived is not None:
-        note.is_archived = data.is_archived
-    if data.folder_id is not None:
-        if data.folder_id == 0:
-            note.folder_id = None
-        else:
-            folder = Folder.query.filter_by(id=data.folder_id, owner_id=user_id).first()
-            if not folder:
-                return jsonify({"error": "Folder not found"}), 404
-            note.folder_id = data.folder_id
-
-    if data.tag_ids is not None:
-        tags = Tag.query.filter(Tag.id.in_(data.tag_ids), Tag.owner_id == user_id).all()
-        note.tags = tags
-
-    db.session.commit()
-    return jsonify(note.to_dict())
-
-
-@notes_bp.delete("/<int:note_id>")
-@jwt_required()
-def delete_note(note_id: int):
-    user_id = get_current_user_id()
-    note = Note.query.filter_by(id=note_id, owner_id=user_id).first()
+@router.delete("/{note_id}", status_code=status.HTTP_200_OK)
+async def delete_note(
+    note_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Delete a note permanently"""
+    result = await db.execute(
+        select(Note).where(Note.id == note_id, Note.owner_id == current_user.id)
+    )
+    note = result.scalar_one_or_none()
+    
     if not note:
-        return jsonify({"error": "Note not found"}), 404
-
-    db.session.delete(note)
-    db.session.commit()
-    return jsonify({"message": "Note deleted"}), 200
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Note not found"
+        )
+    
+    await db.delete(note)
+    await db.commit()
+    
+    return {"message": "Note deleted"}

@@ -1,86 +1,168 @@
-from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity
-from pydantic import BaseModel, Field, ValidationError
-from typing import Optional
+"""
+Folders CRUD Routes - FastAPI Implementation
+Organize notes into hierarchical folder structure
+"""
 
-from app.extensions import db
+from fastapi import APIRouter, HTTPException, Depends, status
+from pydantic import BaseModel, Field
+from typing import Optional, List
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.extensions import get_db
 from app.models import Folder
+from app.routes.auth import get_current_user, User
 
-folders_bp = Blueprint("folders", __name__)
+router = APIRouter()
 
 
-class FolderSchema(BaseModel):
+# Pydantic Schemas
+class FolderCreateSchema(BaseModel):
     name: str = Field(min_length=1, max_length=150)
     parent_id: Optional[int] = None
 
 
-def get_current_user_id() -> int:
-    return int(get_jwt_identity())
+class FolderUpdateSchema(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=150)
+    parent_id: Optional[int] = None
 
 
-@folders_bp.get("")
-@jwt_required()
-def list_folders():
-    user_id = get_current_user_id()
-    folders = Folder.query.filter_by(owner_id=user_id, parent_id=None).order_by(Folder.name).all()
-    return jsonify([f.to_dict(include_children=True) for f in folders])
+@router.get("", response_model=List[dict])
+async def list_folders(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    List all top-level folders for current user.
+    
+    Returns folders with nested children (if any).
+    """
+    result = await db.execute(
+        select(Folder)
+        .where(Folder.owner_id == current_user.id, Folder.parent_id.is_(None))
+        .order_by(Folder.name)
+    )
+    folders = result.scalars().all()
+    
+    return [folder.to_dict(include_children=True) for folder in folders]
 
 
-@folders_bp.post("")
-@jwt_required()
-def create_folder():
-    user_id = get_current_user_id()
-    try:
-        data = FolderSchema(**request.get_json())
-    except ValidationError as e:
-        return jsonify({"error": "Validation failed", "details": e.errors()}), 400
-
+@router.post("", response_model=dict, status_code=201)
+async def create_folder(
+    data: FolderCreateSchema,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a new folder"""
+    # Validate parent folder if provided
     if data.parent_id:
-        parent = Folder.query.filter_by(id=data.parent_id, owner_id=user_id).first()
+        result = await db.execute(
+            select(Folder).where(
+                Folder.id == data.parent_id, 
+                Folder.owner_id == current_user.id
+            )
+        )
+        parent = result.scalar_one_or_none()
         if not parent:
-            return jsonify({"error": "Parent folder not found"}), 404
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Parent folder not found"
+            )
+    
+    # Create folder
+    folder = Folder(
+        name=data.name,
+        parent_id=data.parent_id,
+        owner_id=current_user.id,
+    )
+    
+    db.add(folder)
+    await db.commit()
+    await db.refresh(folder)
+    
+    return folder.to_dict()
 
-    folder = Folder(name=data.name, parent_id=data.parent_id, owner_id=user_id)
-    db.session.add(folder)
-    db.session.commit()
-    return jsonify(folder.to_dict()), 201
 
-
-@folders_bp.put("/<int:folder_id>")
-@jwt_required()
-def update_folder(folder_id: int):
-    user_id = get_current_user_id()
-    folder = Folder.query.filter_by(id=folder_id, owner_id=user_id).first()
+@router.put("/{folder_id}", response_model=dict)
+async def update_folder(
+    folder_id: int,
+    data: FolderUpdateSchema,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update an existing folder's name or parent"""
+    result = await db.execute(
+        select(Folder).where(Folder.id == folder_id, Folder.owner_id == current_user.id)
+    )
+    folder = result.scalar_one_or_none()
+    
     if not folder:
-        return jsonify({"error": "Folder not found"}), 404
-
-    try:
-        data = FolderSchema(**request.get_json())
-    except ValidationError as e:
-        return jsonify({"error": "Validation failed", "details": e.errors()}), 400
-
-    folder.name = data.name
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found"
+        )
+    
+    # Update name if provided
+    if data.name is not None:
+        folder.name = data.name
+    
+    # Update parent if provided
     if data.parent_id is not None:
         if data.parent_id == 0:
             folder.parent_id = None
         else:
-            parent = Folder.query.filter_by(id=data.parent_id, owner_id=user_id).first()
-            if not parent or parent.id == folder.id:
-                return jsonify({"error": "Invalid parent"}), 400
+            # Validate new parent exists and isn't self or descendant
+            if data.parent_id == folder_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot set folder as its own parent"
+                )
+            
+            parent_result = await db.execute(
+                select(Folder).where(
+                    Folder.id == data.parent_id, 
+                    Folder.owner_id == current_user.id
+                )
+            )
+            parent = parent_result.scalar_one_or_none()
+            
+            if not parent:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid parent folder"
+                )
+            
             folder.parent_id = data.parent_id
+    
+    await db.commit()
+    await db.refresh(folder)
+    
+    return folder.to_dict()
 
-    db.session.commit()
-    return jsonify(folder.to_dict())
 
-
-@folders_bp.delete("/<int:folder_id>")
-@jwt_required()
-def delete_folder(folder_id: int):
-    user_id = get_current_user_id()
-    folder = Folder.query.filter_by(id=folder_id, owner_id=user_id).first()
+@router.delete("/{folder_id}", status_code=status.HTTP_200_OK)
+async def delete_folder(
+    folder_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Delete a folder and all its contents.
+    
+    WARNING: This will also delete all notes within this folder!
+    """
+    result = await db.execute(
+        select(Folder).where(Folder.id == folder_id, Folder.owner_id == current_user.id)
+    )
+    folder = result.scalar_one_or_none()
+    
     if not folder:
-        return jsonify({"error": "Folder not found"}), 404
-
-    db.session.delete(folder)
-    db.session.commit()
-    return jsonify({"message": "Folder deleted"})
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Folder not found"
+        )
+    
+    await db.delete(folder)
+    await db.commit()
+    
+    return {"message": "Folder deleted"}
